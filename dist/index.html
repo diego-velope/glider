@@ -114,14 +114,8 @@
         <div id="hud-dist">Dist: 0</div>
       </div>
 
-      <div id="ui-pause" class="screen">
-        <div style="font-size: 64px; color: #ffcc44; text-shadow: 0 0 20px rgba(255, 170, 0, 0.6); margin-bottom: 18px;">
-          PAUSED
-        </div>
-        <div style="font-size: 26px; color: #fff; text-shadow: 0 0 12px rgba(255, 255, 255, 0.35);">
-          Press Enter to Resume
-        </div>
-      </div>
+      <!-- ui-pause: visibility toggled by JS (screen=2), actual rendering done on canvas -->
+      <div id="ui-pause" class="screen" style="background: none; pointer-events: none;"></div>
 
       <div id="ui-gameover" class="screen">
         <div style="font-size: 64px; color: #f44; text-shadow: 0 0 20px rgba(255, 0, 0, 0.35); margin-bottom: 18px;">
@@ -148,6 +142,18 @@
           };
           importObject.env.js_save_hi = function (s) {
             localStorage.setItem("glider_hi", s.toString());
+          };
+          importObject.env.js_get_initial_game_speed = function () {
+            // gameSpeed=1..10 => 10%..100%
+            try {
+              var params = new URLSearchParams(window.location.search);
+              var raw = parseInt(params.get("gameSpeed"), 10);
+              if (!Number.isFinite(raw)) return 10;
+              raw = Math.max(1, Math.min(10, raw));
+              return raw;
+            } catch (e) {
+              return 10;
+            }
           };
 
           importObject.env.js_set_hud = function (score, combo, hi, dist) {

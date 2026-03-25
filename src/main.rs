@@ -27,7 +27,9 @@ async fn main() {
             .unwrap();
     bg_tex.set_filter(FilterMode::Nearest);
 
-    let mut game = game::Game::new(player_tex, bg_tex);
+    let ui_font: Font = load_ttf_font("assets/Orbitron-Bold.ttf").await.unwrap();
+
+    let mut game = game::Game::new(player_tex, bg_tex, ui_font);
 
     loop {
         game.update();

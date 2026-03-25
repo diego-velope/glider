@@ -7,6 +7,7 @@ pub const SCREEN_H: f32 = 720.0;
 extern "C" {
     fn js_load_hi() -> i32;
     fn js_save_hi(s: i32);
+    fn js_get_initial_game_speed() -> i32;
 
     fn js_set_hud(score: i32, combo: f32, hi: i32, dist: i32);
     // 1 = playing, 2 = paused, 3 = game over
@@ -21,6 +22,11 @@ unsafe fn js_load_hi() -> i32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn js_save_hi(_s: i32) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn js_get_initial_game_speed() -> i32 {
+    10
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub unsafe fn js_set_hud(_score: i32, _combo: f32, _hi: i32, _dist: i32) {}
@@ -214,6 +220,7 @@ pub struct Game {
     state: GameState,
     player_tex: Texture2D,
     bg_tex: Texture2D,
+    ui_font: Font,
     player: Player,
     cam_x: f32,
     time: f32,
@@ -223,6 +230,16 @@ pub struct Game {
     score: f32,
     distance_travelled: f32,
     hi_score: i32,
+
+    // Game speed (1..=10 UI setting) - 1 = 10% speed, 10 = 100% speed.
+    game_speed_idx: i32,
+    pending_game_speed_idx: i32,
+    sim_accum: f32,
+
+    // Pause menu state
+    pause_sel: i32,      // 0: Return to Game, 1: Settings
+    settings_sel: i32,   // 0: Game Speed, 1: Save
+    settings_open: bool,
 
     // Procedural terrain, stored as 1 column per X pixel.
     terrain_start_x: i32,
@@ -283,11 +300,15 @@ enum FadeState {
 }
 
 impl Game {
-    pub fn new(player_tex: Texture2D, bg_tex: Texture2D) -> Self {
+    pub fn new(player_tex: Texture2D, bg_tex: Texture2D, ui_font: Font) -> Self {
+        let initial_speed = unsafe { js_get_initial_game_speed() };
+        let game_speed_idx = initial_speed.clamp(1, 10);
+
         let mut g = Self {
             state: GameState::Playing,
             player_tex,
             bg_tex,
+            ui_font,
             player: Player {
                 x: 0.0,
                 y: 0.0,
@@ -306,6 +327,14 @@ impl Game {
             score: 0.0,
             distance_travelled: 0.0,
             hi_score: unsafe { js_load_hi() },
+
+            game_speed_idx,
+            pending_game_speed_idx: game_speed_idx,
+            sim_accum: 0.0,
+
+            pause_sel: 0,
+            settings_sel: 0,
+            settings_open: false,
 
             terrain_start_x: 0,
             terrain: Vec::new(),
@@ -356,6 +385,11 @@ impl Game {
     fn reset(&mut self) {
         self.state = GameState::Playing;
         self.time = 0.0;
+        self.sim_accum = 0.0;
+        self.pause_sel = 0;
+        self.settings_sel = 0;
+        self.settings_open = false;
+        self.pending_game_speed_idx = self.game_speed_idx;
 
         self.combo = 1.0;
         self.score = 0.0;
@@ -808,22 +842,392 @@ impl Game {
         }
     }
 
+    fn game_speed_mult(&self) -> f32 {
+        // 1..=10 => 0.1..=1.0
+        (self.game_speed_idx as f32) / 10.0
+    }
+
+    fn update_pause_menu(
+        &mut self,
+        up: bool,
+        down: bool,
+        left: bool,
+        right: bool,
+        enter: bool,
+        back: bool,
+    ) {
+        // BACK behavior:
+        // - On the main pause menu: resume the game.
+        // - In Settings: discard changes and go back to pause menu.
+        if back {
+            if !self.settings_open {
+                self.state = GameState::Playing;
+                return;
+            }
+
+            self.settings_open = false;
+            self.pending_game_speed_idx = self.game_speed_idx;
+            return;
+        }
+
+        if !self.settings_open {
+            if down {
+                self.pause_sel = (self.pause_sel + 1) % 2;
+            } else if up {
+                self.pause_sel = (self.pause_sel + 1) % 2;
+            }
+
+            if enter {
+                match self.pause_sel {
+                    0 => {
+                        self.state = GameState::Playing;
+                    }
+                    1 => {
+                        self.settings_open = true;
+                        self.pending_game_speed_idx = self.game_speed_idx;
+                        self.settings_sel = 0; // Game Speed
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        // Settings submenu
+        if down {
+            self.settings_sel = (self.settings_sel + 1) % 2;
+        } else if up {
+            self.settings_sel = (self.settings_sel + 1) % 2;
+        }
+
+        // Only allow changing speed with Left/Right when focused on the speed option.
+        if self.settings_sel == 0 {
+            if left {
+                self.pending_game_speed_idx = (self.pending_game_speed_idx - 1).max(1);
+            }
+            if right {
+                self.pending_game_speed_idx = (self.pending_game_speed_idx + 1).min(10);
+            }
+        }
+
+        if enter && self.settings_sel == 1 {
+            // Save -> apply pending speed and return to main pause menu.
+            self.game_speed_idx = self.pending_game_speed_idx;
+            self.settings_open = false;
+            self.pause_sel = 1; // highlight "Settings"
+        }
+    }
+
+    fn draw_pause_overlay(&self) {
+        const HALF_W: f32 = SCREEN_W * 0.5;
+        const HALF_H: f32 = SCREEN_H * 0.5;
+
+        // ── Deep vignette backdrop ──────────────────────────────────────────
+        draw_rectangle(0.0, 0.0, SCREEN_W, SCREEN_H, Color::new(0.0, 0.0, 0.08, 0.72));
+
+        // ── Panel geometry ──────────────────────────────────────────────────
+        let panel_w = 560.0;
+        let panel_h = 380.0;
+        let panel_x = HALF_W - panel_w * 0.5;
+        let panel_y = HALF_H - panel_h * 0.5;
+        let pad = 28.0;
+
+        // Outer glow border (wide, very faint)
+        draw_rectangle_lines(
+            panel_x - 3.0, panel_y - 3.0,
+            panel_w + 6.0, panel_h + 6.0,
+            6.0,
+            Color::new(0.1, 0.55, 1.0, 0.12),
+        );
+
+        // Main panel background
+        draw_rectangle(
+            panel_x, panel_y,
+            panel_w, panel_h,
+            Color::new(0.04, 0.06, 0.14, 0.96),
+        );
+
+        // Subtle inner gradient highlight (top quarter, lighter)
+        draw_rectangle(
+            panel_x, panel_y,
+            panel_w, panel_h * 0.28,
+            Color::new(0.15, 0.25, 0.55, 0.14),
+        );
+
+        // Outer border
+        draw_rectangle_lines(
+            panel_x, panel_y,
+            panel_w, panel_h,
+            2.0,
+            Color::new(0.25, 0.65, 1.0, 0.50),
+        );
+
+        // Top accent bar (full-width color stripe at very top)
+        let accent_h = 4.0;
+        // Drawn as two halves to simulate a horizontal gradient
+        draw_rectangle(
+            panel_x,          panel_y,
+            panel_w * 0.5,    accent_h,
+            Color::new(0.20, 0.70, 1.0, 0.90),
+        );
+        draw_rectangle(
+            panel_x + panel_w * 0.5, panel_y,
+            panel_w * 0.5,           accent_h,
+            Color::new(0.80, 0.50, 1.0, 0.90),
+        );
+
+        // ── Helpers ─────────────────────────────────────────────────────────
+        let ui_text = |text: &str, cx: f32, cy: f32, size: f32, color: Color| {
+            let dims = measure_text(text, Some(&self.ui_font), size as u16, 1.0);
+            let x = cx - dims.width * 0.5;
+            let y = cy + dims.offset_y - dims.height * 0.5;
+            draw_text_ex(text, x, y, TextParams {
+                font: Some(&self.ui_font),
+                font_size: size as u16,
+                color,
+                ..Default::default()
+            });
+        };
+
+        // Right-aligned text helper
+        let ui_text_right = |text: &str, rx: f32, cy: f32, size: f32, color: Color, font: &Font| {
+            let dims = measure_text(text, Some(font), size as u16, 1.0);
+            let x = rx - dims.width;
+            let y = cy + dims.offset_y - dims.height * 0.5;
+            draw_text_ex(text, x, y, TextParams {
+                font: Some(font),
+                font_size: size as u16,
+                color,
+                ..Default::default()
+            });
+        };
+
+        if !self.settings_open {
+            // ── Title ───────────────────────────────────────────────────────
+            let title_y = panel_y + 72.0;
+
+            // Glow shadow (slightly offset, low-opacity gold)
+            ui_text("PAUSED", HALF_W + 2.0, title_y + 2.0, 62.0,
+                Color::new(1.0, 0.70, 0.0, 0.25));
+            // Main title
+            ui_text("PAUSED", HALF_W, title_y, 62.0,
+                Color::new(1.00, 0.88, 0.28, 1.0));
+
+            // Thin divider under title
+            let div_y = panel_y + 94.0;
+            draw_line(
+                panel_x + pad, div_y,
+                panel_x + panel_w - pad, div_y,
+                1.0,
+                Color::new(0.25, 0.65, 1.0, 0.30),
+            );
+
+            // ── Menu rows ───────────────────────────────────────────────────
+            let btn_x      = panel_x + pad;
+            let btn_w      = panel_w - pad * 2.0;
+            let btn_h      = 62.0;
+            let row1_y     = div_y + 22.0;
+            let row2_y     = row1_y + btn_h + 14.0;
+
+            let row1_sel = self.pause_sel == 0;
+            let row2_sel = self.pause_sel == 1;
+
+            // Colour palette
+            let bg_sel       = Color::new(0.12, 0.48, 1.0, 0.22);
+            let bg_unsel     = Color::new(1.0,  1.0,  1.0, 0.05);
+            let border_sel   = Color::new(0.30, 0.75, 1.0, 0.80);
+            let border_unsel = Color::new(1.0,  1.0,  1.0, 0.14);
+            let text_sel     = WHITE;
+            let text_unsel   = Color::new(0.70, 0.75, 0.85, 1.0);
+
+            // ── Row 1: Return to Game ────────────────────────────────────────
+            draw_rectangle(btn_x, row1_y, btn_w, btn_h,
+                if row1_sel { bg_sel } else { bg_unsel });
+            draw_rectangle_lines(btn_x, row1_y, btn_w, btn_h, 2.0,
+                if row1_sel { border_sel } else { border_unsel });
+
+            // Left accent pip when selected
+            if row1_sel {
+                draw_rectangle(btn_x, row1_y, 4.0, btn_h,
+                    Color::new(0.30, 0.80, 1.0, 1.0));
+            }
+
+            // Arrow + label, left-padded
+            let arrow1 = if row1_sel { "> " } else { "  " };
+            let label1 = format!("{}RETURN TO GAME", arrow1);
+            let text_y1 = row1_y + btn_h * 0.5 + 11.0;
+            ui_text(&label1, HALF_W, text_y1, 26.0,
+                if row1_sel { text_sel } else { text_unsel });
+
+            // Keyboard hint (right-aligned)
+            let hint1 = "[ ENTER ]";
+            ui_text_right(hint1,
+                btn_x + btn_w - 12.0,
+                text_y1,
+                16.0,
+                Color::new(0.50, 0.75, 1.0, if row1_sel { 0.75 } else { 0.30 }),
+                &self.ui_font,
+            );
+
+            // ── Row 2: Settings ──────────────────────────────────────────────
+            draw_rectangle(btn_x, row2_y, btn_w, btn_h,
+                if row2_sel { bg_sel } else { bg_unsel });
+            draw_rectangle_lines(btn_x, row2_y, btn_w, btn_h, 2.0,
+                if row2_sel { border_sel } else { border_unsel });
+
+            if row2_sel {
+                draw_rectangle(btn_x, row2_y, 4.0, btn_h,
+                    Color::new(0.30, 0.80, 1.0, 1.0));
+            }
+
+            let arrow2 = if row2_sel { "> " } else { "  " };
+            let label2 = format!("{}SETTINGS", arrow2);
+            let text_y2 = row2_y + btn_h * 0.5 + 11.0;
+            ui_text(&label2, HALF_W, text_y2, 26.0,
+                if row2_sel { text_sel } else { text_unsel });
+
+            let hint2 = "[ ENTER ]";
+            ui_text_right(hint2,
+                btn_x + btn_w - 12.0,
+                text_y2,
+                16.0,
+                Color::new(0.50, 0.75, 1.0, if row2_sel { 0.75 } else { 0.30 }),
+                &self.ui_font,
+            );
+
+            // ── Footer hint ──────────────────────────────────────────────────
+            let footer_y = panel_y + panel_h - 26.0;
+            // Thin divider above footer
+            draw_line(
+                panel_x + pad, footer_y - 14.0,
+                panel_x + panel_w - pad, footer_y - 14.0,
+                1.0,
+                Color::new(1.0, 1.0, 1.0, 0.10),
+            );
+            ui_text(
+                "UP / DOWN to navigate  ·  ESC to resume",
+                HALF_W, footer_y, 16.0,
+                Color::new(0.55, 0.65, 0.80, 0.80),
+            );
+
+        } else {
+            // ══ SETTINGS submenu ════════════════════════════════════════════
+
+            // Title
+            let title_y = panel_y + 68.0;
+            ui_text("SETTINGS", HALF_W + 2.0, title_y + 2.0, 54.0,
+                Color::new(0.20, 0.80, 1.0, 0.20));
+            ui_text("SETTINGS", HALF_W, title_y, 54.0,
+                Color::new(0.35, 0.95, 1.0, 1.0));
+
+            let div_y = panel_y + 90.0;
+            draw_line(
+                panel_x + pad, div_y,
+                panel_x + panel_w - pad, div_y,
+                1.0,
+                Color::new(0.25, 0.85, 1.0, 0.30),
+            );
+
+            let btn_x  = panel_x + pad;
+            let btn_w  = panel_w - pad * 2.0;
+            let btn_h  = 68.0;
+            let row1_y = div_y + 22.0;
+            let row2_y = row1_y + btn_h + 14.0;
+
+            let row1_sel = self.settings_sel == 0;
+            let row2_sel = self.settings_sel == 1;
+
+            let bg_sel       = Color::new(0.10, 0.70, 0.85, 0.20);
+            let bg_unsel     = Color::new(1.0,  1.0,  1.0,  0.05);
+            let border_sel   = Color::new(0.20, 0.90, 1.0,  0.80);
+            let border_unsel = Color::new(1.0,  1.0,  1.0,  0.14);
+            let text_sel     = WHITE;
+            let text_unsel   = Color::new(0.70, 0.75, 0.85, 1.0);
+
+            // ── Row 1: Game Speed ────────────────────────────────────────────
+            draw_rectangle(btn_x, row1_y, btn_w, btn_h,
+                if row1_sel { bg_sel } else { bg_unsel });
+            draw_rectangle_lines(btn_x, row1_y, btn_w, btn_h, 2.0,
+                if row1_sel { border_sel } else { border_unsel });
+
+            if row1_sel {
+                draw_rectangle(btn_x, row1_y, 4.0, btn_h,
+                    Color::new(0.20, 0.90, 1.0, 1.0));
+            }
+
+            let percent = self.pending_game_speed_idx * 10;
+            let speed_label = format!(
+                "GAME SPEED  {}/10  ({}%)",
+                self.pending_game_speed_idx, percent
+            );
+            ui_text(&speed_label, HALF_W, row1_y + btn_h * 0.40,
+                22.0, if row1_sel { text_sel } else { text_unsel });
+
+            // Speed bar visualisation
+            let bar_x    = btn_x + 20.0;
+            let bar_w    = btn_w - 40.0;
+            let bar_h    = 6.0;
+            let bar_y    = row1_y + btn_h * 0.66;
+            let fill_w   = bar_w * (self.pending_game_speed_idx as f32 / 10.0);
+            draw_rectangle(bar_x, bar_y, bar_w, bar_h,
+                Color::new(1.0, 1.0, 1.0, 0.10));
+            draw_rectangle(bar_x, bar_y, fill_w, bar_h,
+                Color::new(0.20, 0.85, 1.0, 0.85));
+
+            // Hint (left/right arrows)
+            let hint_speed = "< LEFT / RIGHT >";
+            ui_text(hint_speed, HALF_W, row1_y + btn_h - 8.0, 14.0,
+                Color::new(0.45, 0.80, 1.0, if row1_sel { 0.80 } else { 0.30 }));
+
+            // ── Row 2: Save ──────────────────────────────────────────────────
+            draw_rectangle(btn_x, row2_y, btn_w, btn_h,
+                if row2_sel { bg_sel } else { bg_unsel });
+            draw_rectangle_lines(btn_x, row2_y, btn_w, btn_h, 2.0,
+                if row2_sel { border_sel } else { border_unsel });
+
+            if row2_sel {
+                draw_rectangle(btn_x, row2_y, 4.0, btn_h,
+                    Color::new(0.20, 0.90, 1.0, 1.0));
+            }
+
+            let arrow_save = if row2_sel { "> " } else { "  " };
+            let label_save = format!("{}SAVE & RETURN", arrow_save);
+            ui_text(&label_save, HALF_W, row2_y + btn_h * 0.5 + 11.0,
+                26.0, if row2_sel { text_sel } else { text_unsel });
+
+            // ── Footer hint ──────────────────────────────────────────────────
+            let footer_y = panel_y + panel_h - 26.0;
+            draw_line(
+                panel_x + pad, footer_y - 14.0,
+                panel_x + panel_w - pad, footer_y - 14.0,
+                1.0,
+                Color::new(1.0, 1.0, 1.0, 0.10),
+            );
+            ui_text(
+                "UP / DOWN to navigate  ·  ESC discards changes",
+                HALF_W, footer_y, 16.0,
+                Color::new(0.55, 0.65, 0.80, 0.80),
+            );
+        }
+    }
+
     pub fn update(&mut self) {
-        let dt = get_frame_time().min(0.05);
-        let dt_factor = dt * 60.0; // "frame equivalent" scaling
-        self.time += dt;
+        const FIXED_DT: f32 = 1.0 / 60.0;
+
+        let real_dt = get_frame_time().min(0.05);
+        self.time += real_dt;
 
         // Spectacle: update screen shake (runs every frame)
-        self.update_shake(dt);
+        self.update_shake(real_dt);
 
         // Spectacle: update flash decay
-        self.update_flash(dt);
+        self.update_flash(real_dt);
 
         // Spectacle: update fade transitions
-        self.update_fade(dt);
+        self.update_fade(real_dt);
 
         // Spectacle: update entrance animation
-        self.update_entrance(dt);
+        self.update_entrance(real_dt);
 
         // Input shortcuts.
         let back_pressed = is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Backspace);
@@ -833,6 +1237,9 @@ impl Game {
             GameState::Playing => {
                 if back_pressed {
                     self.state = GameState::Paused;
+                    self.pause_sel = 0;
+                    self.settings_open = false;
+                    self.pending_game_speed_idx = self.game_speed_idx;
                     unsafe {
                         js_set_screen(2, 0, 0);
                     }
@@ -844,92 +1251,99 @@ impl Game {
                     js_set_screen(1, 0, 0);
                 }
 
-                // Keep terrain generated around the player for collisions/drawing.
-                let view_right = (self.cam_x.floor() + SCREEN_W + 64.0) as i32;
-                let player_ahead = (self.player.x + SCREEN_W * TERRAIN_AHEAD_SCREENS) as i32;
-                let needed_x = player_ahead.max(view_right);
-                self.ensure_generated_until(needed_x + 2);
-                self.cull_behind_and_tidy();
+                // Fixed-step simulation with speed scaling.
+                self.sim_accum += real_dt * self.game_speed_mult();
 
-                let jump_pressed = is_key_pressed(KeyCode::Up)
-                    || is_key_pressed(KeyCode::Space)
-                    || enter_pressed;
+                while self.sim_accum >= FIXED_DT {
+                    let dt_factor = FIXED_DT * 60.0; // "frame equivalent" scaling
 
-                let jump_held = is_key_down(KeyCode::Up)
-                    || is_key_down(KeyCode::Space)
-                    || is_key_down(KeyCode::Enter);
+                    // Keep terrain generated around the player for collisions/drawing.
+                    let view_right = (self.cam_x.floor() + SCREEN_W + 64.0) as i32;
+                    let player_ahead = (self.player.x + SCREEN_W * TERRAIN_AHEAD_SCREENS) as i32;
+                    let needed_x = player_ahead.max(view_right);
+                    self.ensure_generated_until(needed_x + 2);
+                    self.cull_behind_and_tidy();
 
-                // Spectacle: skip normal physics during entrance animation
-                if self.is_in_entrance {
-                    // Still update camera during entrance
-                    let target_cam_x = self.player.x - SCREEN_W * 0.35;
-                    self.cam_x += (target_cam_x - self.cam_x) * 0.12;
-                    return;
-                }
+                    let jump_pressed = is_key_pressed(KeyCode::Up)
+                        || is_key_pressed(KeyCode::Space)
+                        || enter_pressed;
 
-                if jump_pressed && self.player.on_ground {
-                    self.player.vy = JUMP_FORCE_PER_FRAME;
-                    self.player.on_ground = false;
-                    self.player.backflip_happened = false; // fresh airtime
-                }
+                    let jump_held = is_key_down(KeyCode::Up)
+                        || is_key_down(KeyCode::Space)
+                        || is_key_down(KeyCode::Enter);
 
-                // Horizontal auto-run acceleration.
-                self.player.vx = (self.player.vx + SPEED_INCREASE_PER_FRAME * dt_factor)
-                    .min(MAX_SPEED_PER_FRAME)
-                    .max(RUN_SPEED_PER_FRAME * 0.25);
-
-                // Slope physics (only when grounded).
-                if self.player.on_ground {
-                    if let Some(delta_y) = self.slope_delta_at_feet() {
-                        // If terrain rises to the right, delta_y > 0 => uphill drag.
-                        // If terrain falls to the right, delta_y < 0 => downhill boost.
-                        let dv = self.player.vx.abs() * delta_y.abs() * SLOPE_GAIN;
-                        if delta_y < 0.0 {
-                            self.player.vx += dv;
-                        } else {
-                            self.player.vx -= dv;
-                        }
-                        self.player.vx = self
-                            .player
-                            .vx
-                            .clamp(RUN_SPEED_PER_FRAME * 0.2, MAX_SPEED_PER_FRAME);
+                    // Spectacle: skip normal physics during entrance animation
+                    if self.is_in_entrance {
+                        // Still update camera during entrance
+                        let target_cam_x = self.player.x - SCREEN_W * 0.35;
+                        self.cam_x += (target_cam_x - self.cam_x) * 0.12;
+                        self.sim_accum -= FIXED_DT;
+                        continue;
                     }
-                }
 
-                // Integrate velocities.
-                self.player.vx = self.player.vx.max(0.0);
+                    if jump_pressed && self.player.on_ground {
+                        self.player.vy = JUMP_FORCE_PER_FRAME;
+                        self.player.on_ground = false;
+                        self.player.backflip_happened = false; // fresh airtime
+                    }
 
-                let prev_x = self.player.x;
-                let dx = self.player.vx * dt_factor;
-                self.player.x += dx;
-                self.distance_travelled += dx;
-                self.score += dx * self.combo * SCORE_DISTANCE_MULT;
+                    // Horizontal auto-run acceleration.
+                    self.player.vx = (self.player.vx + SPEED_INCREASE_PER_FRAME * dt_factor)
+                        .min(MAX_SPEED_PER_FRAME)
+                        .max(RUN_SPEED_PER_FRAME * 0.25);
 
-                let prev_bottom = self.player.y + self.player.h;
-                self.player.vy += GRAVITY_PER_FRAME * dt_factor;
-                self.player.y += self.player.vy * dt_factor;
+                    // Slope physics (only when grounded).
+                    if self.player.on_ground {
+                        if let Some(delta_y) = self.slope_delta_at_feet() {
+                            // If terrain rises to the right, delta_y > 0 => uphill drag.
+                            // If terrain falls to the right, delta_y < 0 => downhill boost.
+                            let dv = self.player.vx.abs() * delta_y.abs() * SLOPE_GAIN;
+                            if delta_y < 0.0 {
+                                self.player.vx += dv;
+                            } else {
+                                self.player.vx -= dv;
+                            }
+                            self.player.vx = self
+                                .player
+                                .vx
+                                .clamp(RUN_SPEED_PER_FRAME * 0.2, MAX_SPEED_PER_FRAME);
+                        }
+                    }
 
-                // Terrain collision (land on solid columns, fall through gaps).
-                let was_on_ground = self.player.on_ground;
-                let vy_before_collision = self.player.vy;
-                self.player.on_ground = false;
-                if vy_before_collision >= -0.5 {
-                    // Landing collision should only trigger when the player's
-                    // bottom actually *crosses* the terrain top from above.
-                    // Also, when moving right, exclude terrain columns that were
-                    // not under the player's footprint in the previous frame.
-                    // This prevents "teleporting up" when you hit a rising wall.
-                    let bottom = self.player.y + self.player.h;
-                    let prev_right_x = prev_x + self.player.w;
+                    // Integrate velocities.
+                    self.player.vx = self.player.vx.max(0.0);
 
-                    let left_x_world = self.player.x.floor() as i32;
-                    let right_x_world = (self.player.x + self.player.w - 1.0).floor() as i32;
+                    let prev_x = self.player.x;
+                    let dx = self.player.vx * dt_factor;
+                    self.player.x += dx;
+                    self.distance_travelled += dx;
+                    self.score += dx * self.combo * SCORE_DISTANCE_MULT;
 
-                    const TOP_CROSS_EPS: f32 = 2.8;
-                    const TOP_PEN_EPS: f32 = 4.0;
+                    let prev_bottom = self.player.y + self.player.h;
+                    self.player.vy += GRAVITY_PER_FRAME * dt_factor;
+                    self.player.y += self.player.vy * dt_factor;
 
-                    let mut best_col_y: Option<f32> = None; // pick the highest crossed surface
-                    for wx in left_x_world..=right_x_world {
+                    // Terrain collision (land on solid columns, fall through gaps).
+                    let was_on_ground = self.player.on_ground;
+                    let vy_before_collision = self.player.vy;
+                    self.player.on_ground = false;
+                    if vy_before_collision >= -0.5 {
+                        // Landing collision should only trigger when the player's
+                        // bottom actually *crosses* the terrain top from above.
+                        // Also, when moving right, exclude terrain columns that were
+                        // not under the player's footprint in the previous frame.
+                        // This prevents "teleporting up" when you hit a rising wall.
+                        let bottom = self.player.y + self.player.h;
+                        let prev_right_x = prev_x + self.player.w;
+
+                        let left_x_world = self.player.x.floor() as i32;
+                        let right_x_world = (self.player.x + self.player.w - 1.0).floor() as i32;
+
+                        const TOP_CROSS_EPS: f32 = 2.8;
+                        const TOP_PEN_EPS: f32 = 4.0;
+
+                        let mut best_col_y: Option<f32> = None; // pick the highest crossed surface
+                        for wx in left_x_world..=right_x_world {
                         // If the column starts after where the player's right edge
                         // was in the previous frame, it was likely a "wall entry" this frame.
                         if (wx as f32) >= prev_right_x {
@@ -1049,27 +1463,32 @@ impl Game {
 
                 self.update_particles(dt_factor);
 
-                // When running as WASM, update the HTML overlay HUD
-                // (better typography than canvas text).
-                unsafe {
-                    js_set_hud(
-                        self.score.floor() as i32,
-                        self.combo,
-                        self.hi_score,
-                        self.distance_travelled.floor() as i32,
-                    );
-                }
-            }
-            GameState::Paused => {
-                // Keep background/terrain as-is, but freeze physics.
-                unsafe {
-                    js_set_screen(2, 0, 0);
-                }
+                self.sim_accum -= FIXED_DT;
 
-                if back_pressed || enter_pressed {
-                    self.state = GameState::Playing;
+                if self.state != GameState::Playing {
+                    break;
                 }
             }
+
+            // When running as WASM, update the HTML overlay HUD
+            // (better typography than canvas text).
+            unsafe {
+                js_set_hud(
+                    self.score.floor() as i32,
+                    self.combo,
+                    self.hi_score,
+                    self.distance_travelled.floor() as i32,
+                );
+            }
+        }
+        GameState::Paused => {
+            let up = is_key_pressed(KeyCode::Up);
+            let down = is_key_pressed(KeyCode::Down);
+            let left = is_key_pressed(KeyCode::Left);
+            let right = is_key_pressed(KeyCode::Right);
+
+            self.update_pause_menu(up, down, left, right, enter_pressed, back_pressed);
+        }
             GameState::GameOver => {
                 unsafe {
                     js_set_screen(3, self.score.floor() as i32, self.hi_score);
@@ -1151,28 +1570,13 @@ impl Game {
                     LIGHTGRAY,
                 );
             } else if self.state == GameState::Paused {
-                draw_rectangle(
-                    0.0,
-                    0.0,
-                    SCREEN_W,
-                    SCREEN_H,
-                    Color::new(0.0, 0.0, 0.0, 0.55),
-                );
-                draw_text(
-                    "Paused",
-                    SCREEN_W * 0.5 - 70.0,
-                    SCREEN_H * 0.5 - 20.0,
-                    48.0,
-                    LIGHTGRAY,
-                );
-                draw_text(
-                    "Press Enter to Resume",
-                    SCREEN_W * 0.5 - 170.0,
-                    SCREEN_H * 0.5 + 40.0,
-                    24.0,
-                    WHITE,
-                );
+                self.draw_pause_overlay();
             }
+        }
+
+        // Pause overlay for all builds (drawn on top of everything)
+        if self.state == GameState::Paused {
+            self.draw_pause_overlay();
         }
 
         // Spectacle: draw flash overlay (last so it's on top of everything)
