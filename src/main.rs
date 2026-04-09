@@ -1,6 +1,10 @@
 use macroquad::prelude::*;
 
 mod game;
+mod input;
+
+#[cfg(target_arch = "wasm32")]
+use input::tv_input_manager::init_tv_input_manager;
 
 fn window_conf() -> Conf {
     Conf {
@@ -13,9 +17,12 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let player_tex_res = load_texture("assets/kenney_block-pack/Spritesheet/blockPack_spritesheet.png").await;
-    let bg_tex_res = load_texture("assets/pixel_skies/pixel_skies_1920x1080/demo06_PixelSky_1920x1080.png").await;
-    let font_res = load_ttf_font("assets/Orbitron-Bold.ttf").await;
+    #[cfg(target_arch = "wasm32")]
+    init_tv_input_manager();
+
+    let player_tex_res = load_texture("assets/sprites/blockPack_spritesheet.png").await;
+    let bg_tex_res = load_texture("assets/images/sky.png").await;
+    let font_res = load_ttf_font("assets/fonts/Orbitron-Bold.ttf").await;
 
     if player_tex_res.is_err() || bg_tex_res.is_err() || font_res.is_err() {
         loop {
@@ -29,15 +36,15 @@ async fn main() {
             y += 40.0;
 
             if player_tex_res.is_err() {
-                draw_text("- Missing: assets/kenney_block-pack/Spritesheet/blockPack_spritesheet.png", 30.0, y, 20.0, LIGHTGRAY);
+                draw_text("- Missing: assets/sprites/blockPack_spritesheet.png", 30.0, y, 20.0, LIGHTGRAY);
                 y += 30.0;
             }
             if bg_tex_res.is_err() {
-                draw_text("- Missing: assets/pixel_skies/pixel_skies_1920x1080/demo06_PixelSky_1920x1080.png", 30.0, y, 20.0, LIGHTGRAY);
+                draw_text("- Missing: assets/images/sky.png", 30.0, y, 20.0, LIGHTGRAY);
                 y += 30.0;
             }
             if font_res.is_err() {
-                draw_text("- Missing: assets/Orbitron-Bold.ttf", 30.0, y, 20.0, LIGHTGRAY);
+                draw_text("- Missing: assets/fonts/Orbitron-Bold.ttf", 30.0, y, 20.0, LIGHTGRAY);
                 y += 30.0;
             }
             
@@ -68,4 +75,3 @@ async fn main() {
         next_frame().await
     }
 }
-

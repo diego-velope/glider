@@ -1,35 +1,148 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Building Glider for WASM..."
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DIST_DIR="$PROJECT_DIR/dist"
+WEB_DIR="$PROJECT_DIR/web"
+TARGET="wasm32-unknown-unknown"
+RELEASE_DIR="$PROJECT_DIR/target/$TARGET/release"
 
-# Build WASM release
-cargo build --target wasm32-unknown-unknown --release
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-# Create dist directory
-mkdir -p dist
+# Functions
+print_usage() {
+    echo "Glider Build Script"
+    echo ""
+    echo "Usage: ./build.sh [command]"
+    echo ""
+    echo "Commands:"
+    echo "  check      - Check prerequisites (Rust, wasm32 target)"
+    echo "  wasm       - Build WASM release with TV-safe flags"
+    echo "  package    - Package web/ into dist/"
+    echo "  serve      - Serve dist/ on localhost:8080"
+    echo "  all        - Run check + wasm + package (default)"
+    echo "  clean      - Clean build artifacts"
+    echo "  help       - Show this help"
+    echo ""
+}
 
-# Copy WASM output
-cp target/wasm32-unknown-unknown/release/glider.wasm dist/
+cmd_check() {
+    echo -e "${YELLOW}==> Checking prerequisites...${NC}"
+    
+    # Check Rust
+    if ! command -v rustc &> /dev/null; then
+        echo -e "${RED}Error: Rust not found. Install from https://rustup.rs/${NC}"
+        exit 1
+    fi
+    
+    # Check wasm32 target
+    if ! rustup target list --installed | grep -q "$TARGET"; then
+        echo -e "${YELLOW}Installing wasm32-unknown-unknown target...${NC}"
+        rustup target add "$TARGET"
+    fi
+    
+    echo -e "${GREEN}✓ Prerequisites OK${NC}"
+}
 
-# Copy HTML
-cp index.html dist/
+cmd_wasm() {
+    echo -e "${YELLOW}==> Building WASM (release with TV-safe flags)...${NC}"
+    
+    # Conservative flags for older TV Chromium
+    RUSTFLAGS="-C target-cpu=mvp -C target-feature=-nontrapping-fptoint" \
+        cargo build --release --target "$TARGET"
+    
+    echo -e "${GREEN}✓ WASM build complete${NC}"
+    echo "WASM size: $(du -h "$RELEASE_DIR/glider.wasm" | cut -f1)"
+}
 
-# Copy background texture
-mkdir -p dist/assets/pixel_skies/pixel_skies_1920x1080
-cp "assets/pixel_skies/pixel_skies_1920x1080/demo06_PixelSky_1920x1080.png" \
-   "dist/assets/pixel_skies/pixel_skies_1920x1080/"
+cmd_package() {
+    echo -e "${YELLOW}==> Packaging from web/ into dist/...${NC}"
+    
+    # Create dist directory
+    mkdir -p "$DIST_DIR"
+    
+    # Copy WASM output
+    cp "$RELEASE_DIR/glider.wasm" "$DIST_DIR/"
+    
+    # Copy HTML from web/
+    cp "$WEB_DIR"/*.html "$DIST_DIR/"
+    
+    # Copy optional custom JS files in web/
+    cp "$WEB_DIR"/*.js "$DIST_DIR/" 2>/dev/null || true
+    
+    # Copy PAL modules
+    if [ -d "$WEB_DIR/pal" ]; then
+        cp -r "$WEB_DIR/pal" "$DIST_DIR/"
+    fi
+    
+    # Copy all assets
+    cp -r "$PROJECT_DIR/assets" "$DIST_DIR/"
+    
+    # Download mq_js_bundle.js if missing
+    if [ ! -f "$DIST_DIR/mq_js_bundle.js" ]; then
+        echo -e "${YELLOW}==> Fetching mq_js_bundle.js...${NC}"
+        curl -fsSL https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js \
+            -o "$DIST_DIR/mq_js_bundle.js"
+    fi
+    
+    # Optional wasm-opt optimization (if available)
+    if command -v wasm-opt &> /dev/null; then
+        echo -e "${YELLOW}==> Running wasm-opt...${NC}"
+        wasm-opt -Oz "$DIST_DIR/glider.wasm" -o "$DIST_DIR/glider.wasm" || true
+    fi
+    
+    echo -e "${GREEN}✓ dist/ ready for deployment${NC}"
+}
 
-# Copy spritesheet (needed for player and terrain tiles)
-mkdir -p dist/assets/kenney_block-pack/Spritesheet
-cp assets/kenney_block-pack/Spritesheet/blockPack_spritesheet.png \
-   dist/assets/kenney_block-pack/Spritesheet/
+cmd_serve() {
+    echo -e "${YELLOW}==> Serving on http://localhost:8080${NC}"
+    echo "Press Ctrl+C to stop"
+    
+    cd "$DIST_DIR"
+    python3 -m http.server 8080 || python -m http.server 8080
+}
 
-# Download mq_js_bundle.js if not present
-if [ ! -f dist/mq_js_bundle.js ]; then
-  curl -fsSL https://not-fl3.github.io/miniquad-samples/mq_js_bundle.js \
-    -o dist/mq_js_bundle.js
-fi
+cmd_clean() {
+    echo -e "${YELLOW}==> Cleaning build artifacts...${NC}"
+    cargo clean
+    rm -rf "$DIST_DIR"
+    echo -e "${GREEN}✓ Clean complete${NC}"
+}
 
-echo "✓ dist/ ready for deployment"
-echo "WASM size: $(du -h dist/glider.wasm | cut -f1)"
+# Main
+COMMAND="${1:-all}"
+
+case "$COMMAND" in
+    check)
+        cmd_check
+        ;;
+    wasm)
+        cmd_wasm
+        ;;
+    package)
+        cmd_package
+        ;;
+    serve)
+        cmd_serve
+        ;;
+    all)
+        cmd_check
+        cmd_wasm
+        cmd_package
+        ;;
+    clean)
+        cmd_clean
+        ;;
+    help|--help|-h)
+        print_usage
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $COMMAND${NC}"
+        print_usage
+        exit 1
+        ;;
+esac

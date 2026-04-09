@@ -1,5 +1,9 @@
 use macroquad::prelude::*;
 
+use crate::input::tv_input_manager::get_tv_input_manager;
+#[cfg(target_arch = "wasm32")]
+use crate::input::tv_input_manager::get_tv_input_manager_mut;
+
 pub const SCREEN_W: f32 = 1280.0;
 pub const SCREEN_H: f32 = 720.0;
 
@@ -435,7 +439,7 @@ impl Game {
             tries += 1;
         }
 
-        let ground_y = self
+        let _ground_y = self
             .terrain_at(center_x)
             .map(|c| c.y)
             .unwrap_or(GROUND_Y);
@@ -1060,7 +1064,7 @@ impl Game {
                 if row1_sel { text_sel } else { text_unsel });
 
             // Keyboard hint (right-aligned)
-            let hint1 = "[ ENTER ]";
+            let hint1 = "[ OK ]";
             ui_text_right(hint1,
                 btn_x + btn_w - 12.0,
                 text_y1,
@@ -1086,7 +1090,7 @@ impl Game {
             ui_text(&label2, HALF_W, text_y2, 26.0,
                 if row2_sel { text_sel } else { text_unsel });
 
-            let hint2 = "[ ENTER ]";
+            let hint2 = "[ OK ]";
             ui_text_right(hint2,
                 btn_x + btn_w - 12.0,
                 text_y2,
@@ -1105,7 +1109,7 @@ impl Game {
                 Color::new(1.0, 1.0, 1.0, 0.10),
             );
             ui_text(
-                "UP / DOWN to navigate  ·  ESC to resume",
+                "UP / DOWN to navigate  ·  BACK to resume",
                 HALF_W, footer_y, 16.0,
                 Color::new(0.55, 0.65, 0.80, 0.80),
             );
@@ -1229,9 +1233,11 @@ impl Game {
         // Spectacle: update entrance animation
         self.update_entrance(real_dt);
 
-        // Input shortcuts.
-        let back_pressed = is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Backspace);
-        let enter_pressed = is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
+        // Input shortcuts - keyboard + TV remote (TV edges mirror Macroquad `*_pressed`)
+        let back_pressed = is_key_pressed(KeyCode::Escape)
+            || is_key_pressed(KeyCode::Backspace)
+            || get_tv_input_manager().map_or(false, |tv| tv.back_just_pressed());
+        let enter_key = is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
 
         match self.state {
             GameState::Playing => {
@@ -1264,13 +1270,20 @@ impl Game {
                     self.ensure_generated_until(needed_x + 2);
                     self.cull_behind_and_tidy();
 
+                    let tv_action_just =
+                        get_tv_input_manager().map_or(false, |tv| tv.action_just_pressed());
+                    let tv_action_held =
+                        get_tv_input_manager().map_or(false, |tv| tv.is_action_held());
+
                     let jump_pressed = is_key_pressed(KeyCode::Up)
                         || is_key_pressed(KeyCode::Space)
-                        || enter_pressed;
+                        || enter_key
+                        || tv_action_just;
 
                     let jump_held = is_key_down(KeyCode::Up)
                         || is_key_down(KeyCode::Space)
-                        || is_key_down(KeyCode::Enter);
+                        || is_key_down(KeyCode::Enter)
+                        || tv_action_held;
 
                     // Spectacle: skip normal physics during entrance animation
                     if self.is_in_entrance {
@@ -1482,10 +1495,16 @@ impl Game {
             }
         }
         GameState::Paused => {
-            let up = is_key_pressed(KeyCode::Up);
-            let down = is_key_pressed(KeyCode::Down);
-            let left = is_key_pressed(KeyCode::Left);
-            let right = is_key_pressed(KeyCode::Right);
+            let up = is_key_pressed(KeyCode::Up)
+                || get_tv_input_manager().map_or(false, |tv| tv.up_just_pressed());
+            let down = is_key_pressed(KeyCode::Down)
+                || get_tv_input_manager().map_or(false, |tv| tv.down_just_pressed());
+            let left = is_key_pressed(KeyCode::Left)
+                || get_tv_input_manager().map_or(false, |tv| tv.left_just_pressed());
+            let right = is_key_pressed(KeyCode::Right)
+                || get_tv_input_manager().map_or(false, |tv| tv.right_just_pressed());
+            let enter_pressed = enter_key
+                || get_tv_input_manager().map_or(false, |tv| tv.action_just_pressed());
 
             self.update_pause_menu(up, down, left, right, enter_pressed, back_pressed);
         }
@@ -1494,10 +1513,17 @@ impl Game {
                     js_set_screen(3, self.score.floor() as i32, self.hi_score);
                 }
 
-                if enter_pressed {
+                if enter_key
+                    || get_tv_input_manager().map_or(false, |tv| tv.action_just_pressed())
+                {
                     self.reset();
                 }
             }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        if let Some(tv) = get_tv_input_manager_mut() {
+            tv.sync_prev_from_current();
         }
     }
 
@@ -1563,7 +1589,7 @@ impl Game {
                 }
 
                 draw_text(
-                    "Press Enter to Restart",
+                    "Press OK to Restart",
                     SCREEN_W * 0.5 - 250.0,
                     SCREEN_H * 0.5 + 80.0,
                     24.0,

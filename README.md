@@ -6,7 +6,13 @@ An endless runner / momentum platformer inspired by *Alto's Adventure*, built in
 
 You're automatically skiing down an infinite snowy mountain. One button controls everything:
 
-### Controls
+### TV Remote Controls
+| Button | Action |
+|--------|--------|
+| **D-Pad Up / OK / Select** | Jump (tap) / Backflip (hold in air) |
+| **Return / Back** | Pause |
+
+### Keyboard Controls (for desktop testing)
 | Key | Action |
 |-----|--------|
 | **↑ Arrow / Space / Enter** | Jump (tap) / Backflip (hold in air) |
