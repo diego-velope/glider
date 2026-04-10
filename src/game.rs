@@ -245,6 +245,9 @@ pub struct Game {
     settings_sel: i32,   // 0: Game Speed, 1: Save
     settings_open: bool,
 
+    /// Previous-frame Escape/Backspace (edge detection when PAL is not used).
+    prev_back_kb: bool,
+
     // Procedural terrain, stored as 1 column per X pixel.
     terrain_start_x: i32,
     terrain: Vec<TerrainCol>,
@@ -339,6 +342,7 @@ impl Game {
             pause_sel: 0,
             settings_sel: 0,
             settings_open: false,
+            prev_back_kb: false,
 
             terrain_start_x: 0,
             terrain: Vec::new(),
@@ -394,6 +398,7 @@ impl Game {
         self.settings_sel = 0;
         self.settings_open = false;
         self.pending_game_speed_idx = self.game_speed_idx;
+        self.prev_back_kb = false;
 
         self.combo = 1.0;
         self.score = 0.0;
@@ -1233,10 +1238,18 @@ impl Game {
         // Spectacle: update entrance animation
         self.update_entrance(real_dt);
 
-        // Input shortcuts - keyboard + TV remote (TV edges mirror Macroquad `*_pressed`)
-        let back_pressed = is_key_pressed(KeyCode::Escape)
-            || is_key_pressed(KeyCode::Backspace)
-            || get_tv_input_manager().map_or(false, |tv| tv.back_just_pressed());
+        // Edge-only for Back: OR-ing held Escape (browser maps TV Back) with PAL edge
+        // toggled pause every frame while the key stayed down.
+        let kb_back_held =
+            is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Backspace);
+        let kb_back_edge = kb_back_held && !self.prev_back_kb;
+        let tv_back_edge =
+            get_tv_input_manager().map_or(false, |tv| tv.back_just_pressed());
+        let back_pressed = if get_tv_input_manager().is_some() {
+            tv_back_edge
+        } else {
+            kb_back_edge
+        };
         let enter_key = is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
 
         match self.state {
@@ -1248,6 +1261,11 @@ impl Game {
                     self.pending_game_speed_idx = self.game_speed_idx;
                     unsafe {
                         js_set_screen(2, 0, 0);
+                    }
+                    self.prev_back_kb = kb_back_held;
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(tv) = get_tv_input_manager_mut() {
+                        tv.sync_prev_from_current();
                     }
                     return;
                 }
@@ -1525,6 +1543,8 @@ impl Game {
         if let Some(tv) = get_tv_input_manager_mut() {
             tv.sync_prev_from_current();
         }
+
+        self.prev_back_kb = kb_back_held;
     }
 
     pub fn draw(&self) {
